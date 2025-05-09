@@ -1,6 +1,7 @@
 import datetime
 import logging
 import pathlib
+import csv
 from typing import Optional
 
 import cv2
@@ -28,6 +29,9 @@ class Demo:
         self.cap = self._create_capture()
         self.output_dir = self._create_output_dir()
         self.writer = self._create_video_writer()
+        self.log_file = None
+        self.csv_writer = None
+        self._setup_logging()
 
         self.stop = False
         self.show_bbox = self.config.demo.show_bbox
@@ -36,31 +40,63 @@ class Demo:
         self.show_normalized_image = self.config.demo.show_normalized_image
         self.show_template_model = self.config.demo.show_template_model
 
+    def _setup_logging(self):
+        """Sets up the CSV file and writer for logging annotations."""
+        if self.output_dir and (self.config.demo.use_camera or self.config.demo.video_path):
+            if self.config.demo.use_camera:
+                log_name = f'log_{self._create_timestamp()}.csv'
+            elif self.config.demo.video_path:
+                name = pathlib.Path(self.config.demo.video_path).stem
+                log_name = f'log_{name}.csv'
+            else:
+                return
+            
+            log_path = self.output_dir / log_name
+            logger.info(f'Logging annotations to: {log_path}')
+            self.log_file = open(log_path, 'w', newline='')
+            self.csv_writer = csv.writer(self.log_file)
+            
+            header = [
+                'frame', 'face_id',
+                'bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2',
+                'head_rot_x', 'head_rot_y', 'head_rot_z',
+                'head_pos_x', 'head_pos_y', 'head_pos_z',
+                'gaze_vector_face_x', 'gaze_vector_face_y', 'gaze_vector_face_z',
+                'gaze_pitch_face', 'gaze_yaw_face',
+                'gaze_vector_reye_x', 'gaze_vector_reye_y', 'gaze_vector_reye_z',
+                'gaze_pitch_reye', 'gaze_yaw_reye',
+                'gaze_vector_leye_x', 'gaze_vector_leye_y', 'gaze_vector_leye_z',
+                'gaze_pitch_leye', 'gaze_yaw_leye'
+            ]
+            self.csv_writer.writerow(header)
+
     def run(self) -> None:
         if self.config.demo.use_camera or self.config.demo.video_path:
             self._run_on_video()
         elif self.config.demo.image_path:
-            self._run_on_image()
+            image = cv2.imread(self.config.demo.image_path)
+            self._process_image(image, frame_number=0)
+            if self.config.demo.display_on_screen:
+                while True:
+                    key_pressed = self._wait_key()
+                    if self.stop:
+                        break
+                    if key_pressed:
+                        self._process_image(image, frame_number=0)
+                    cv2.imshow('image', self.visualizer.image)
+            if self.config.demo.output_dir:
+                name = pathlib.Path(self.config.demo.image_path).name
+                output_path = pathlib.Path(self.config.demo.output_dir) / name
+                cv2.imwrite(output_path.as_posix(), self.visualizer.image)
         else:
             raise ValueError
 
-    def _run_on_image(self):
-        image = cv2.imread(self.config.demo.image_path)
-        self._process_image(image)
-        if self.config.demo.display_on_screen:
-            while True:
-                key_pressed = self._wait_key()
-                if self.stop:
-                    break
-                if key_pressed:
-                    self._process_image(image)
-                cv2.imshow('image', self.visualizer.image)
-        if self.config.demo.output_dir:
-            name = pathlib.Path(self.config.demo.image_path).name
-            output_path = pathlib.Path(self.config.demo.output_dir) / name
-            cv2.imwrite(output_path.as_posix(), self.visualizer.image)
+        if self.log_file:
+            self.log_file.close()
+            logger.info("Annotation log file closed.")
 
     def _run_on_video(self) -> None:
+        frame_number = 0
         while True:
             if self.config.demo.display_on_screen:
                 self._wait_key()
@@ -70,23 +106,59 @@ class Demo:
             ok, frame = self.cap.read()
             if not ok:
                 break
-            self._process_image(frame)
+
+            self._process_image(frame, frame_number)
 
             if self.config.demo.display_on_screen:
                 cv2.imshow('frame', self.visualizer.image)
+
+            frame_number += 1
+
         self.cap.release()
         if self.writer:
             self.writer.release()
 
-    def _process_image(self, image) -> None:
+    def _process_image(self, image, frame_number: int) -> None:
         undistorted = cv2.undistort(
             image, self.gaze_estimator.camera.camera_matrix,
             self.gaze_estimator.camera.dist_coefficients)
 
         self.visualizer.set_image(image.copy())
         faces = self.gaze_estimator.detect_faces(undistorted)
-        for face in faces:
+
+        for face_index, face in enumerate(faces):
             self.gaze_estimator.estimate_gaze(undistorted, face)
+
+            bbox = face.bbox.flatten().tolist() if face.bbox is not None else [None]*4
+            head_rot_euler = face.head_pose_rot.as_euler('XYZ', degrees=True).tolist() if face.head_pose_rot else [None]*3
+            head_pos = face.head_position.flatten().tolist() if face.head_position is not None else [None]*3
+            gaze_vector_face = face.gaze_vector.tolist() if face.gaze_vector is not None else [None]*3
+            pitch_yaw_face = np.rad2deg(face.vector_to_angle(face.gaze_vector)).tolist() if face.gaze_vector is not None else [None]*2
+
+            if self.config.mode == 'MPIIGaze':
+                reye_gaze_vector = face.reye.gaze_vector.tolist() if hasattr(face, 'reye') and face.reye.gaze_vector is not None else [None]*3
+                reye_pitch_yaw = np.rad2deg(face.reye.vector_to_angle(face.reye.gaze_vector)).tolist() if hasattr(face, 'reye') and face.reye.gaze_vector is not None else [None]*2
+                leye_gaze_vector = face.leye.gaze_vector.tolist() if hasattr(face, 'leye') and face.leye.gaze_vector is not None else [None]*3
+                leye_pitch_yaw = np.rad2deg(face.leye.vector_to_angle(face.leye.gaze_vector)).tolist() if hasattr(face, 'leye') and face.leye.gaze_vector is not None else [None]*2
+            else:
+                reye_gaze_vector, reye_pitch_yaw = [None]*3, [None]*2
+                leye_gaze_vector, leye_pitch_yaw = [None]*3, [None]*2
+
+            if self.csv_writer:
+                row = [
+                    frame_number, face_index,
+                    *bbox,
+                    *head_rot_euler,
+                    *head_pos,
+                    *gaze_vector_face,
+                    *pitch_yaw_face,
+                    *reye_gaze_vector,
+                    *reye_pitch_yaw,
+                    *leye_gaze_vector,
+                    *leye_pitch_yaw
+                ]
+                self.csv_writer.writerow(row)
+
             self._draw_face_bbox(face)
             self._draw_head_pose(face)
             self._draw_landmarks(face)
@@ -177,7 +249,6 @@ class Demo:
     def _draw_head_pose(self, face: Face) -> None:
         if not self.show_head_pose:
             return
-        # Draw the axes of the model coordinate system
         length = self.config.demo.head_pose_axis_length
         self.visualizer.draw_model_axes(face, length, lw=2)
 
